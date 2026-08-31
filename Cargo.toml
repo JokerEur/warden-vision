@@ -1,6 +1,6 @@
 [package]
 name = "warden-vision"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Reusable computer vision building blocks for detection, tracking, and annotation, in the spirit of Roboflow's Python `supervision` library."
 license = "MIT"
@@ -40,6 +40,20 @@ datasets = ["dep:image", "dep:serde", "dep:serde_json", "dep:quick-xml"]
 [[example]]
 name = "quickstart"
 required-features = ["annotate-image"]
+
+[[example]]
+name = "tracking_and_counting"
+required-features = ["annotate-image"]
+
+[[example]]
+name = "onnx_postprocessing"
+
+[[example]]
+name = "metrics_evaluation"
+
+[[example]]
+name = "dataset_io"
+required-features = ["datasets"]
 
 [dev-dependencies]
 approx = "0.5"

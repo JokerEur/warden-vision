@@ -103,6 +103,16 @@ BoxAnnotator::default().annotate(&mut frame, &detections).unwrap();
 Runnable version: `cargo run --example quickstart --features annotate-image`
 (see `examples/quickstart.rs`).
 
+More examples in `examples/`:
+
+| Example | What it shows | Run with |
+| --- | --- | --- |
+| `quickstart` | Detections → tracker → box annotator | `cargo run --example quickstart --features annotate-image` |
+| `tracking_and_counting` | `ByteTracker` across multiple frames, `LineZone` in/out counting, trace + line-zone annotators | `cargo run --example tracking_and_counting --features annotate-image` |
+| `onnx_postprocessing` | Parsing a raw YOLOv8-style ONNX tensor into `Detections`, NMS, rescaling to the original image size | `cargo run --example onnx_postprocessing` |
+| `metrics_evaluation` | Precision/Recall/F1/mAP accumulated across a small predictions-vs-targets set | `cargo run --example metrics_evaluation` |
+| `dataset_io` | Building a `DetectionDataset` and round-tripping it through YOLO format | `cargo run --example dataset_io --features datasets` |
+
 ## Module overview
 
 | Module | Contents |
