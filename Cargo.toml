@@ -1,0 +1,52 @@
+[package]
+name = "warden-vision"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable computer vision building blocks for detection, tracking, and annotation, in the spirit of Roboflow's Python `supervision` library."
+license = "MIT"
+repository = "https://github.com/<your-github-username>/warden-vision"
+readme = "README.md"
+keywords = ["computer-vision", "object-detection", "tracking", "annotation"]
+categories = ["computer-vision", "science"]
+
+[dependencies]
+ndarray = "0.17.2"
+nalgebra = "0.35.0"
+lapjv = "0.3.0"
+thiserror = "2.0.20"
+image = { version = "0.25.10", optional = true }
+opencv = { version = "0.100.1", default-features = false, features = ["imgproc", "videoio"], optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
+quick-xml = { version = "0.42.0", optional = true }
+ab_glyph = { version = "0.2.32", optional = true }
+
+[features]
+default = ["core"]
+# Pure-Rust geometry, tracking, and data-structure logic. No heavy native
+# dependencies; always available.
+core = []
+# Pure-Rust annotation backend (drawing on `image::RgbaImage`). Includes
+# `ab_glyph` for RichLabelAnnotator's real TTF/OTF text rendering.
+annotate-image = ["dep:image", "dep:ab_glyph"]
+# High-performance annotation/video backend built on the OpenCV C++ bindings.
+# Requires a system OpenCV install; not needed for pure geometry/tracking use.
+annotate-opencv = ["dep:opencv"]
+# COCO/YOLO/Pascal VOC dataset loaders and exporters. Pulls in `image`
+# (for header-only dimension reads), `serde`/`serde_json` (COCO), and
+# `quick-xml` (Pascal VOC).
+datasets = ["dep:image", "dep:serde", "dep:serde_json", "dep:quick-xml"]
+
+[[example]]
+name = "quickstart"
+required-features = ["annotate-image"]
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3.27.0"
+
+# docs.rs has no system OpenCV install, so `annotate-opencv` (and the
+# `video` module it gates) can't build there; document every other
+# feature instead of leaving the published docs at bare `core`.
+[package.metadata.docs.rs]
+features = ["annotate-image", "datasets"]
