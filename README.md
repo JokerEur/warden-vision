@@ -1,6 +1,5 @@
 # warden-vision
 
-[![CI](https://github.com/<your-github-username>/warden-vision/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-github-username>/warden-vision/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/warden-vision.svg)](https://crates.io/crates/warden-vision)
 [![docs.rs](https://img.shields.io/docsrs/warden-vision)](https://docs.rs/warden-vision)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
