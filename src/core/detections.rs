@@ -7,7 +7,9 @@
 
 use ndarray::{Array1, Array2};
 
-use crate::geometry::{polygon_centroid, Point, Position, Rect};
+use crate::geometry::{
+    oriented_box_area, oriented_box_iou, polygon_centroid, Point, Position, Rect,
+};
 
 /// A single detected object.
 ///
@@ -26,10 +28,18 @@ pub struct Detection {
     pub tracker_id: Option<usize>,
     /// Optional instance segmentation mask, stored as a polygon contour.
     pub mask: Option<Vec<[f32; 2]>>,
+    /// Optional oriented (rotated) bounding box, as four corner points in
+    /// either winding order. When set, [`Detection::iou`] and
+    /// [`Detection::area`] use it instead of the axis-aligned `bbox`,
+    /// which stays populated as its envelope so untouched code (NMS,
+    /// trackers, zones) keeps working. Build one with [`Detection::from_obb`]
+    /// rather than setting this field directly, so `bbox` stays consistent
+    /// with it.
+    pub obb: Option<[[f32; 2]; 4]>,
 }
 
 impl Detection {
-    /// Creates a new detection with no tracker id or mask.
+    /// Creates a new detection with no tracker id, mask, or oriented box.
     pub fn new(bbox: [f32; 4], confidence: f32, class_id: usize) -> Self {
         Self {
             bbox,
@@ -37,6 +47,35 @@ impl Detection {
             class_id,
             tracker_id: None,
             mask: None,
+            obb: None,
+        }
+    }
+
+    /// Creates a detection from an oriented bounding box's four corners
+    /// (any consistent winding order), e.g. from a YOLOv8-OBB-style
+    /// detector.
+    ///
+    /// `bbox` is set to the corners' axis-aligned envelope, so this
+    /// detection still works with everything that only understands
+    /// axis-aligned boxes (NMS ordering by confidence, [`crate::tracker`]
+    /// motion association, [`crate::geometry`] zones). `mask` is set to
+    /// the same four corners, so [`crate::annotators::PolygonAnnotator`] /
+    /// [`crate::annotators::MaskAnnotator`] render the rotated rectangle
+    /// with no separate oriented-box annotator needed.
+    pub fn from_obb(corners: [[f32; 2]; 4], confidence: f32, class_id: usize) -> Self {
+        let xs = corners.iter().map(|c| c[0]);
+        let ys = corners.iter().map(|c| c[1]);
+        let x1 = xs.clone().fold(f32::INFINITY, f32::min);
+        let x2 = xs.fold(f32::NEG_INFINITY, f32::max);
+        let y1 = ys.clone().fold(f32::INFINITY, f32::min);
+        let y2 = ys.fold(f32::NEG_INFINITY, f32::max);
+        Self {
+            bbox: [x1, y1, x2, y2],
+            confidence,
+            class_id,
+            tracker_id: None,
+            mask: Some(corners.to_vec()),
+            obb: Some(corners),
         }
     }
 
@@ -50,8 +89,13 @@ impl Detection {
         self.bbox[3] - self.bbox[1]
     }
 
-    /// Area of the bounding box.
+    /// Area of the detection: the true rotated-quad area when
+    /// [`Detection::obb`] is set (which is generally smaller than its
+    /// axis-aligned envelope), otherwise the bounding box's area.
     pub fn area(&self) -> f32 {
+        if let Some(obb) = &self.obb {
+            return oriented_box_area(&corners_to_points(obb));
+        }
         self.width().max(0.0) * self.height().max(0.0)
     }
 
@@ -63,8 +107,16 @@ impl Detection {
         )
     }
 
-    /// Intersection-over-union with another detection's bounding box.
+    /// Intersection-over-union with another detection.
+    ///
+    /// Uses rotated-polygon IoU over [`Detection::obb`] when both
+    /// detections have one (axis-aligned IoU over-counts overlap for
+    /// thin, rotated objects), falling back to axis-aligned `bbox` IoU
+    /// otherwise.
     pub fn iou(&self, other: &Detection) -> f32 {
+        if let (Some(a), Some(b)) = (&self.obb, &other.obb) {
+            return oriented_box_iou(&corners_to_points(a), &corners_to_points(b));
+        }
         bbox_iou(self.bbox, other.bbox)
     }
 
@@ -85,6 +137,10 @@ impl Detection {
         }
         Rect::from_xyxy(self.bbox).anchor(position)
     }
+}
+
+fn corners_to_points(corners: &[[f32; 2]; 4]) -> [Point; 4] {
+    corners.map(|[x, y]| Point::new(x, y))
 }
 
 /// Intersection-over-union of two `[x1, y1, x2, y2]` bounding boxes.
@@ -197,28 +253,109 @@ impl Detections {
     /// both kept. When `true`, overlap is compared across all detections
     /// regardless of class.
     pub fn non_max_suppression(&self, iou_threshold: f32, class_agnostic: bool) -> Detections {
-        let mut order: Vec<usize> = (0..self.len()).collect();
-        order.sort_by(|&a, &b| {
-            self.detections[b]
-                .confidence
-                .total_cmp(&self.detections[a].confidence)
-        });
-
+        let order = Self::confidence_order(&self.detections);
         let mut suppressed = vec![false; self.len()];
         let mut kept = Vec::with_capacity(self.len());
 
-        for &i in &order {
+        for pos in 0..order.len() {
+            let i = order[pos];
             if suppressed[i] {
                 continue;
             }
             kept.push(self.detections[i].clone());
-            for &j in &order {
-                if j == i || suppressed[j] {
+            // Only the boxes ranked below `i` still need a keep/suppress
+            // decision: anything ranked above `i` was already resolved
+            // (kept or suppressed) on an earlier iteration, so comparing
+            // against it again can't change the output.
+            for &j in &order[pos + 1..] {
+                if suppressed[j] {
                     continue;
                 }
                 let same_class =
                     class_agnostic || self.detections[i].class_id == self.detections[j].class_id;
                 if same_class && self.detections[i].iou(&self.detections[j]) > iou_threshold {
+                    suppressed[j] = true;
+                }
+            }
+        }
+
+        Detections::new(kept)
+    }
+
+    /// Indices into `detections`, sorted by descending confidence.
+    fn confidence_order(detections: &[Detection]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..detections.len()).collect();
+        order.sort_by(|&a, &b| {
+            detections[b]
+                .confidence
+                .total_cmp(&detections[a].confidence)
+        });
+        order
+    }
+
+    /// Same semantics as [`Detections::non_max_suppression`], but the
+    /// expensive part — per-pair IoU — is precomputed with `rayon` in one
+    /// parallel pass before the (inherently sequential) greedy keep/suppress
+    /// bookkeeping runs.
+    ///
+    /// This two-phase split, rather than parallelizing the suppression scan
+    /// directly, is deliberate: the naive approach of dispatching a `rayon`
+    /// job per surviving candidate at every step of the sequential loop was
+    /// tried first and measured *slower* than the plain sequential version
+    /// (see `examples/bench_vs_supervision.rs`) — thousands of small,
+    /// decreasing-size parallel dispatches lose to their own overhead.
+    /// Precomputing the whole pairwise relation up front is one large,
+    /// evenly-sized parallel job, which is what `rayon` is actually good at;
+    /// the sequential pass left over is then just boolean lookups, no
+    /// floating-point IoU math.
+    ///
+    /// Trades `O(n^2)` bits of scratch memory for that speedup — worthwhile
+    /// once a frame has hundreds to thousands of candidate boxes (e.g.
+    /// before merging an [`crate::core::InferenceSlicer`]'s tiles); for a
+    /// detector's usual few dozen boxes, or when boxes carry an
+    /// [`crate::core::Detection::obb`] (rotated-polygon IoU is
+    /// meaningfully more expensive than axis-aligned), the crossover point
+    /// where this wins moves lower.
+    #[cfg(feature = "parallel")]
+    pub fn non_max_suppression_parallel(
+        &self,
+        iou_threshold: f32,
+        class_agnostic: bool,
+    ) -> Detections {
+        use rayon::prelude::*;
+
+        let order = Self::confidence_order(&self.detections);
+        let n = order.len();
+
+        // `would_suppress[pos][k]`: does `order[pos]` suppress
+        // `order[pos + 1 + k]`? This relation only depends on the raw
+        // detections, not on suppression bookkeeping, so every row is
+        // independent and safe to compute in parallel.
+        let would_suppress: Vec<Vec<bool>> = (0..n)
+            .into_par_iter()
+            .map(|pos| {
+                let i = order[pos];
+                order[pos + 1..]
+                    .iter()
+                    .map(|&j| {
+                        let same_class = class_agnostic
+                            || self.detections[i].class_id == self.detections[j].class_id;
+                        same_class && self.detections[i].iou(&self.detections[j]) > iou_threshold
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut suppressed = vec![false; n];
+        let mut kept = Vec::with_capacity(n);
+        for pos in 0..n {
+            let i = order[pos];
+            if suppressed[i] {
+                continue;
+            }
+            kept.push(self.detections[i].clone());
+            for (k, &j) in order[pos + 1..].iter().enumerate() {
+                if would_suppress[pos][k] {
                     suppressed[j] = true;
                 }
             }
@@ -260,6 +397,7 @@ impl Detections {
                         .mask
                         .as_ref()
                         .map(|polygon| polygon.iter().map(|&[x, y]| [x * sx, y * sy]).collect());
+                    scaled.obb = d.obb.map(|corners| corners.map(|[x, y]| [x * sx, y * sy]));
                     scaled
                 })
                 .collect(),
@@ -466,5 +604,111 @@ mod tests {
         let dets = Detections::empty();
         assert!(dets.is_empty());
         assert_eq!(dets.xyxy().shape(), &[0, 4]);
+    }
+
+    fn square_obb(cx: f32, cy: f32, half: f32) -> [[f32; 2]; 4] {
+        [
+            [cx - half, cy - half],
+            [cx + half, cy - half],
+            [cx + half, cy + half],
+            [cx - half, cy + half],
+        ]
+    }
+
+    #[test]
+    fn from_obb_sets_bbox_to_the_axis_aligned_envelope() {
+        // A 45deg-rotated square's envelope is bigger than the square
+        // itself, which is exactly why axis-aligned NMS/tracking still
+        // needs this envelope even when `obb` carries the true shape.
+        let corners = [[10.0, 0.0], [20.0, 10.0], [10.0, 20.0], [0.0, 10.0]];
+        let d = Detection::from_obb(corners, 0.9, 0);
+        assert_eq!(d.bbox, [0.0, 0.0, 20.0, 20.0]);
+        assert_eq!(d.obb, Some(corners));
+    }
+
+    #[test]
+    fn from_obb_also_populates_mask_for_existing_polygon_annotators() {
+        let corners = square_obb(10.0, 10.0, 5.0);
+        let d = Detection::from_obb(corners, 0.9, 0);
+        assert_eq!(d.mask, Some(corners.to_vec()));
+    }
+
+    #[test]
+    fn area_uses_true_rotated_area_not_the_envelope() {
+        let corners = [[10.0, 0.0], [20.0, 10.0], [10.0, 20.0], [0.0, 10.0]];
+        let d = Detection::from_obb(corners, 0.9, 0);
+        // Diamond of diagonal 20 has area 200, well under its 20x20 = 400
+        // axis-aligned envelope.
+        assert!((d.area() - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn iou_prefers_obb_over_axis_aligned_bbox_when_both_have_one() {
+        let a = Detection::from_obb(square_obb(0.0, 0.0, 10.0), 0.9, 0);
+        let rotated = square_obb(0.0, 0.0, 10.0).map(|[x, y]| {
+            let theta: f32 = 45.0_f32.to_radians();
+            [
+                x * theta.cos() - y * theta.sin(),
+                x * theta.sin() + y * theta.cos(),
+            ]
+        });
+        let b = Detection::from_obb(rotated, 0.9, 0);
+        // Both envelopes fully overlap (axis-aligned IoU would read close
+        // to 1.0 for the rotated square's bounding box), but the actual
+        // rotated shapes overlap far less.
+        assert!(a.iou(&b) < 0.8, "iou was {}", a.iou(&b));
+    }
+
+    #[test]
+    fn iou_falls_back_to_bbox_when_only_one_side_has_obb() {
+        let a = Detection::from_obb(square_obb(0.0, 0.0, 5.0), 0.9, 0);
+        let b = det([-5.0, -5.0, 5.0, 5.0], 0.9, 0);
+        assert!((a.iou(&b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scale_also_scales_obb_corners() {
+        let d = Detection::from_obb(square_obb(1.0, 1.0, 1.0), 0.9, 0);
+        let dets = Detections::new(vec![d]);
+        let scaled = dets.scale(2.0, 3.0);
+        assert_eq!(
+            scaled.detections[0].obb,
+            Some([[0.0, 0.0], [4.0, 0.0], [4.0, 6.0], [0.0, 6.0]])
+        );
+    }
+
+    #[test]
+    fn nms_keeps_only_the_remaining_scan_reachable_by_position() {
+        // Regression guard for the "scan only order[pos+1..]" optimization:
+        // three heavily-overlapping same-class boxes should still collapse
+        // to exactly the highest-confidence one, not an artifact of
+        // scanning order.
+        let dets = Detections::new(vec![
+            det([0.0, 0.0, 10.0, 10.0], 0.5, 0),
+            det([0.5, 0.5, 10.5, 10.5], 0.95, 0),
+            det([1.0, 1.0, 11.0, 11.0], 0.7, 0),
+        ]);
+        let kept = dets.non_max_suppression(0.3, false);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.detections[0].confidence, 0.95);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn non_max_suppression_parallel_matches_the_sequential_result() {
+        let dets = Detections::new(vec![
+            det([0.0, 0.0, 10.0, 10.0], 0.9, 0),
+            det([1.0, 1.0, 11.0, 11.0], 0.6, 0),
+            det([100.0, 100.0, 110.0, 110.0], 0.8, 0),
+            det([1.0, 1.0, 11.0, 11.0], 0.4, 1),
+        ]);
+        let sequential = dets.non_max_suppression(0.5, false);
+        let parallel = dets.non_max_suppression_parallel(0.5, false);
+        assert_eq!(sequential.len(), parallel.len());
+        let mut seq_conf: Vec<f32> = sequential.iter().map(|d| d.confidence).collect();
+        let mut par_conf: Vec<f32> = parallel.iter().map(|d| d.confidence).collect();
+        seq_conf.sort_by(f32::total_cmp);
+        par_conf.sort_by(f32::total_cmp);
+        assert_eq!(seq_conf, par_conf);
     }
 }

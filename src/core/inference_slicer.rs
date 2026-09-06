@@ -11,7 +11,7 @@
 //! on that region — via `image::RgbaImage`, an `opencv::core::Mat`, or
 //! anything else — is entirely up to them.
 
-use crate::core::Detections;
+use crate::core::{Detection, Detections};
 
 /// Slices an image into overlapping tiles for per-tile inference.
 #[derive(Debug, Clone, Copy)]
@@ -86,21 +86,59 @@ impl InferenceSlicer {
         for tile in self.slices(image_width, image_height) {
             let [offset_x, offset_y, _, _] = tile;
             let tile_detections = callback(tile);
-            merged.extend(tile_detections.iter().map(|detection| {
-                let mut offset = detection.clone();
-                let [x1, y1, x2, y2] = detection.bbox;
-                offset.bbox = [x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y];
-                offset.mask = detection.mask.as_ref().map(|polygon| {
-                    polygon
-                        .iter()
-                        .map(|&[x, y]| [x + offset_x, y + offset_y])
-                        .collect()
-                });
-                offset
-            }));
+            merged.extend(
+                tile_detections
+                    .iter()
+                    .map(|detection| offset_detection(detection, offset_x, offset_y)),
+            );
         }
         Detections::new(merged).non_max_suppression(self.iou_threshold, false)
     }
+
+    /// Same contract as [`InferenceSlicer::run`], but runs `callback` over
+    /// tiles in parallel with `rayon`. `callback` must be safe to call
+    /// concurrently from multiple threads (e.g. a detector session that
+    /// doesn't need `&mut self`, or one already wrapped in your own
+    /// per-thread pool) — see [`Detections::non_max_suppression_parallel`]
+    /// for when this is worth reaching for over `run`.
+    #[cfg(feature = "parallel")]
+    pub fn run_parallel<F>(&self, image_width: u32, image_height: u32, callback: F) -> Detections
+    where
+        F: Fn([f32; 4]) -> Detections + Sync,
+    {
+        use rayon::prelude::*;
+
+        let merged: Vec<Detection> = self
+            .slices(image_width, image_height)
+            .par_iter()
+            .flat_map(|&tile| {
+                let [offset_x, offset_y, _, _] = tile;
+                callback(tile)
+                    .iter()
+                    .map(|detection| offset_detection(detection, offset_x, offset_y))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Detections::new(merged).non_max_suppression(self.iou_threshold, false)
+    }
+}
+
+/// Translates a tile-local detection's bbox/mask/obb into full-image
+/// coordinates.
+fn offset_detection(detection: &Detection, offset_x: f32, offset_y: f32) -> Detection {
+    let mut offset = detection.clone();
+    let [x1, y1, x2, y2] = detection.bbox;
+    offset.bbox = [x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y];
+    offset.mask = detection.mask.as_ref().map(|polygon| {
+        polygon
+            .iter()
+            .map(|&[x, y]| [x + offset_x, y + offset_y])
+            .collect()
+    });
+    offset.obb = detection
+        .obb
+        .map(|corners| corners.map(|[x, y]| [x + offset_x, y + offset_y]));
+    offset
 }
 
 /// Tile start positions along one axis: steps of `slice_len * (1 -

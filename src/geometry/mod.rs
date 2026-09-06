@@ -2,6 +2,7 @@
 //! regions of interest.
 
 mod line_zone;
+mod oriented_box;
 mod point;
 mod polygon;
 mod polygon_zone;
@@ -9,6 +10,7 @@ mod position;
 mod rect;
 
 pub use line_zone::LineZone;
+pub use oriented_box::{oriented_box_area, oriented_box_iou};
 pub use point::Point;
 pub use polygon::{filter_polygons_by_area, polygon_area, polygon_centroid, polygon_to_rect};
 pub use polygon_zone::PolygonZone;
