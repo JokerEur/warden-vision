@@ -1,6 +1,6 @@
 [package]
 name = "warden-vision"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Reusable computer vision building blocks for detection, tracking, and annotation, in the spirit of Roboflow's Python `supervision` library."
 license = "MIT"
